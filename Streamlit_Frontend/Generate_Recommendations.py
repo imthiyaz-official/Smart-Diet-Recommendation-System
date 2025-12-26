@@ -1,9 +1,12 @@
 import requests
 import json
 import logging
+import time
 from typing import List, Dict, Any, Optional, Union
 from dataclasses import dataclass
-import time
+import pandas as pd
+import numpy as np
+import random
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -25,37 +28,42 @@ class RecipeRequest:
         }
 
 class RecipeAPI:
-    """Handles communication with the recipe recommendation API"""
+    """Handles communication with the recipe recommendation API with fallback"""
     
-    def __init__(self, base_url: str = "http://127.0.0.1:8000"):
-        self.base_url = base_url
-        self.predict_url = f"{base_url}/predict"
-        self.health_url = f"{base_url}/health"
-        self.stats_url = f"{base_url}/stats"
-        self.timeout = 30
+    def __init__(self, base_url: Optional[str] = None):
+        # Use provided URL or try localhost, but always have fallback
+        self.base_url = base_url or "http://127.0.0.1:8000"
+        self.predict_url = f"{self.base_url}/predict"
+        self.health_url = f"{self.base_url}/health"
+        self.stats_url = f"{self.base_url}/stats"
+        self.timeout = 10  # Reduced timeout for faster fallback
+        self.use_api = False  # Will be set based on health check
         
     def check_health(self) -> bool:
-        """Check if the API server is healthy"""
+        """Check if the API server is healthy - with timeout"""
         try:
-            response = requests.get(self.health_url, timeout=10)
-            return response.status_code == 200
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Health check failed: {e}")
-            return False
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """Get API statistics"""
-        try:
-            response = requests.get(self.stats_url, timeout=10)
+            # Try localhost first, but fail fast
+            response = requests.get(self.health_url, timeout=5)
             if response.status_code == 200:
-                return response.json()
-            return {}
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to get stats: {e}")
-            return {}
+                self.use_api = True
+                return True
+        except (requests.exceptions.ConnectionError, 
+                requests.exceptions.Timeout,
+                requests.exceptions.RequestException) as e:
+            logger.info(f"API health check failed: {e}. Using fallback mode.")
+            self.use_api = False
+            return False
+        return False
     
-    def predict(self, request_data: RecipeRequest) -> requests.Response:
-        """Make prediction request to API"""
+    def predict(self, request_data: RecipeRequest) -> Dict[str, Any]:
+        """
+        Make prediction request to API with automatic fallback
+        Returns dict instead of Response object for consistency
+        """
+        if not self.use_api:
+            # Already know API is not available
+            raise ConnectionError("API server not available. Using fallback mode.")
+        
         try:
             response = requests.post(
                 url=self.predict_url,
@@ -66,21 +74,23 @@ class RecipeAPI:
                     "Accept": "application/json"
                 }
             )
-            return response
-        except requests.exceptions.Timeout:
-            logger.error("Request timeout")
-            raise
-        except requests.exceptions.ConnectionError:
-            logger.error("Connection error - check if API server is running")
-            raise
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Request failed: {e}")
-            raise
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                raise ConnectionError(f"API returned status {response.status_code}")
+                
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.RequestException) as e:
+            logger.warning(f"API request failed: {e}")
+            self.use_api = False  # Disable API for future requests
+            raise ConnectionError(f"API connection failed: {e}")
 
 class Generator:
     """
     Main generator class for recipe recommendations
-    Handles nutrition input, ingredients, and API communication
+    Handles nutrition input, ingredients, with fallback when API is unavailable
     """
     
     # Default nutrition categories for reference
@@ -190,195 +200,44 @@ class Generator:
         nutrition_input: Optional[List[float]] = None,
         ingredients: Optional[List[str]] = None,
         params: Optional[Dict[str, Any]] = None,
-        api_url: str = "http://127.0.0.1:8000"
+        api_url: Optional[str] = None
     ):
         """
         Initialize the Generator
         
         Args:
-            nutrition_input: List of nutrition values in order:
-                [Calories, FatContent, SaturatedFatContent, CholesterolContent,
-                 SodiumContent, CarbohydrateContent, FiberContent, SugarContent,
-                 ProteinContent]
+            nutrition_input: List of nutrition values
             ingredients: List of ingredient names
-            params: Dictionary of parameters for the recommendation algorithm
-            api_url: URL of the recommendation API
+            params: Dictionary of parameters
+            api_url: URL of the recommendation API (optional)
         """
         self.nutrition_input = nutrition_input or []
         self.ingredients = ingredients or []
         self.params = {**self.DEFAULT_PARAMS, **(params or {})}
+        
+        # Initialize API with automatic fallback detection
         self.api = RecipeAPI(api_url)
+        
+        # Try to connect to API, but don't fail if unavailable
+        try:
+            self.api_available = self.api.check_health()
+            if self.api_available:
+                logger.info("API server is available")
+            else:
+                logger.info("API server not available, using standalone mode")
+        except Exception as e:
+            logger.info(f"API check failed: {e}. Using standalone mode.")
+            self.api_available = False
+        
         self.last_response = None
         self.last_request_time = None
         
-    def set_request(self, 
-                   nutrition_input: List[float], 
-                   ingredients: List[str], 
-                   params: Dict[str, Any]) -> None:
-        """
-        Set request parameters
-        
-        Args:
-            nutrition_input: Nutrition values
-            ingredients: List of ingredients
-            params: Algorithm parameters
-        """
-        self.nutrition_input = nutrition_input
-        self.ingredients = ingredients
-        self.params = {**self.DEFAULT_PARAMS, **params}
-        
-    def validate_nutrition_input(self) -> bool:
-        """
-        Validate nutrition input format
-        
-        Returns:
-            bool: True if valid, False otherwise
-        """
-        if not self.nutrition_input:
-            logger.warning("Nutrition input is empty")
-            return False
-            
-        if len(self.nutrition_input) != len(self.NUTRITION_CATEGORIES):
-            logger.error(f"Expected {len(self.NUTRITION_CATEGORIES)} nutrition values, "
-                        f"got {len(self.nutrition_input)}")
-            return False
-            
-        # Check for negative values (some might be acceptable, but warn)
-        negatives = [val for val in self.nutrition_input if val < 0]
-        if negatives:
-            logger.warning(f"Found {len(negatives)} negative nutrition values")
-            
-        return True
+        # Initialize recipe database for standalone mode
+        self._init_recipe_database()
     
-    def normalize_ingredients(self, ingredients: List[str]) -> List[str]:
-        """
-        Normalize ingredient names (lowercase, strip whitespace)
-        
-        Args:
-            ingredients: List of ingredient names
-            
-        Returns:
-            List[str]: Normalized ingredient names
-        """
-        normalized = []
-        for ingredient in ingredients:
-            if ingredient:  # Skip empty strings
-                normalized.append(ingredient.strip().lower())
-        return list(set(normalized))  # Remove duplicates
-    
-    def get_ingredient_suggestions(self, category: Optional[str] = None) -> List[str]:
-        """
-        Get ingredient suggestions by category or all
-        
-        Args:
-            category: Optional category name
-            
-        Returns:
-            List[str]: List of ingredient suggestions
-        """
-        if category and category in self.INGREDIENT_CATEGORIES:
-            return self.INGREDIENT_CATEGORIES[category]
-        elif category:
-            logger.warning(f"Category '{category}' not found")
-            return []
-        else:
-            # Return all ingredients flattened
-            all_ingredients = []
-            for cat_ingredients in self.INGREDIENT_CATEGORIES.values():
-                all_ingredients.extend(cat_ingredients)
-            return all_ingredients
-    
-    def get_categorized_ingredients(self) -> Dict[str, List[str]]:
-        """
-        Get ingredients organized by category
-        
-        Returns:
-            Dict[str, List[str]]: Categorized ingredients
-        """
-        return self.INGREDIENT_CATEGORIES.copy()
-    
-    def generate(self, max_retries: int = 3) -> requests.Response:
-        """
-        Generate recipe recommendations
-        
-        Args:
-            max_retries: Maximum number of retry attempts
-            
-        Returns:
-            requests.Response: API response object
-        """
-        # Validate input
-        if not self.validate_nutrition_input():
-            raise ValueError("Invalid nutrition input format")
-        
-        # Normalize ingredients
-        normalized_ingredients = self.normalize_ingredients(self.ingredients)
-        
-        # Prepare request
-        request_data = RecipeRequest(
-            nutrition_input=self.nutrition_input,
-            ingredients=normalized_ingredients,
-            params=self.params
-        )
-        
-        # Try with retries
-        for attempt in range(max_retries):
-            try:
-                logger.info(f"Attempt {attempt + 1}/{max_retries}: "
-                          f"Requesting {self.params['n_neighbors']} recommendations")
-                
-                response = self.api.predict(request_data)
-                self.last_response = response
-                self.last_request_time = time.time()
-                
-                if response.status_code == 200:
-                    logger.info(f"Successfully received {len(response.json().get('output', []))} recommendations")
-                    return response
-                else:
-                    logger.warning(f"API returned status code {response.status_code}")
-                    
-            except requests.exceptions.RequestException as e:
-                logger.error(f"Request failed on attempt {attempt + 1}: {e}")
-                
-                # Wait before retry (exponential backoff)
-                if attempt < max_retries - 1:
-                    wait_time = 2 ** attempt  # Exponential backoff
-                    logger.info(f"Waiting {wait_time} seconds before retry...")
-                    time.sleep(wait_time)
-                else:
-                    raise
-        
-        raise Exception(f"Failed to get response after {max_retries} attempts")
-    
-    def generate_with_fallback(self) -> List[Dict[str, Any]]:
-        """
-        Generate recommendations with fallback to mock data if API fails
-        
-        Returns:
-            List[Dict[str, Any]]: Recipe recommendations
-        """
-        try:
-            response = self.generate()
-            if response.status_code == 200:
-                data = response.json()
-                return data.get("output", [])
-            else:
-                logger.warning(f"API returned error, using fallback data")
-                return self._get_fallback_recipes()
-                
-        except Exception as e:
-            logger.error(f"Generation failed: {e}, using fallback data")
-            return self._get_fallback_recipes()
-    
-    def _get_fallback_recipes(self) -> List[Dict[str, Any]]:
-        """
-        Get fallback recipes when API is unavailable
-        
-        Returns:
-            List[Dict[str, Any]]: Fallback recipe data
-        """
-        # Simple fallback recipes based on common inputs
-        fallback_recipes = [
+    def _init_recipe_database(self):
+        """Initialize recipe database for standalone mode"""
+        self.recipe_database = [
             {
                 "Name": "Grilled Chicken Bowl",
                 "Calories": 450,
@@ -426,23 +285,322 @@ class Generator:
                 "SodiumContent": 280,
                 "RecipeIngredientParts": ["rice", "broccoli", "garlic", "soy sauce", "sesame oil"],
                 "RecipeInstructions": ["Cook rice", "Steam broccoli", "Sauté garlic", "Combine all ingredients", "Season with soy sauce and sesame oil"]
+            },
+            {
+                "Name": "Salmon with Asparagus",
+                "Calories": 420,
+                "PrepTime": 10,
+                "CookTime": 15,
+                "ProteinContent": 38,
+                "FatContent": 22,
+                "CarbohydrateContent": 18,
+                "FiberContent": 6,
+                "SugarContent": 4,
+                "SaturatedFatContent": 4,
+                "CholesterolContent": 95,
+                "SodiumContent": 320,
+                "RecipeIngredientParts": ["salmon", "asparagus", "lemon", "garlic", "olive oil", "dill"],
+                "RecipeInstructions": ["Season salmon", "Roast asparagus", "Pan-sear salmon", "Squeeze lemon", "Garnish with dill"]
+            },
+            {
+                "Name": "Veggie Stir Fry",
+                "Calories": 280,
+                "PrepTime": 15,
+                "CookTime": 10,
+                "ProteinContent": 14,
+                "FatContent": 10,
+                "CarbohydrateContent": 35,
+                "FiberContent": 9,
+                "SugarContent": 8,
+                "SaturatedFatContent": 1,
+                "CholesterolContent": 0,
+                "SodiumContent": 450,
+                "RecipeIngredientParts": ["tofu", "broccoli", "carrot", "bell pepper", "soy sauce", "ginger"],
+                "RecipeInstructions": ["Press tofu", "Chop vegetables", "Stir fry tofu", "Add vegetables", "Season with sauce"]
+            },
+            {
+                "Name": "Greek Yogurt Parfait",
+                "Calories": 250,
+                "PrepTime": 5,
+                "CookTime": 0,
+                "ProteinContent": 20,
+                "FatContent": 5,
+                "CarbohydrateContent": 32,
+                "FiberContent": 6,
+                "SugarContent": 18,
+                "SaturatedFatContent": 2,
+                "CholesterolContent": 15,
+                "SodiumContent": 120,
+                "RecipeIngredientParts": ["greek yogurt", "granola", "mixed berries", "honey", "chia seeds"],
+                "RecipeInstructions": ["Layer yogurt", "Add granola", "Top with berries", "Drizzle honey", "Sprinkle chia seeds"]
+            },
+            {
+                "Name": "Quinoa Salad",
+                "Calories": 320,
+                "PrepTime": 20,
+                "CookTime": 15,
+                "ProteinContent": 18,
+                "FatContent": 14,
+                "CarbohydrateContent": 38,
+                "FiberContent": 7,
+                "SugarContent": 5,
+                "SaturatedFatContent": 2,
+                "CholesterolContent": 0,
+                "SodiumContent": 280,
+                "RecipeIngredientParts": ["quinoa", "cucumber", "tomato", "red onion", "feta cheese", "olive oil"],
+                "RecipeInstructions": ["Cook quinoa", "Chop vegetables", "Mix ingredients", "Add dressing", "Chill before serving"]
+            },
+            {
+                "Name": "Beef and Broccoli",
+                "Calories": 380,
+                "PrepTime": 15,
+                "CookTime": 12,
+                "ProteinContent": 42,
+                "FatContent": 16,
+                "CarbohydrateContent": 22,
+                "FiberContent": 5,
+                "SugarContent": 6,
+                "SaturatedFatContent": 4,
+                "CholesterolContent": 105,
+                "SodiumContent": 520,
+                "RecipeIngredientParts": ["beef strips", "broccoli", "garlic", "ginger", "soy sauce", "sesame oil"],
+                "RecipeInstructions": ["Slice beef", "Blanch broccoli", "Stir fry beef", "Add broccoli", "Season with sauce"]
+            },
+            {
+                "Name": "Avocado Toast",
+                "Calories": 220,
+                "PrepTime": 5,
+                "CookTime": 3,
+                "ProteinContent": 8,
+                "FatContent": 12,
+                "CarbohydrateContent": 22,
+                "FiberContent": 7,
+                "SugarContent": 2,
+                "SaturatedFatContent": 2,
+                "CholesterolContent": 0,
+                "SodiumContent": 180,
+                "RecipeIngredientParts": ["whole wheat bread", "avocado", "lemon juice", "salt", "pepper", "red pepper flakes"],
+                "RecipeInstructions": ["Toast bread", "Mash avocado", "Add lemon juice", "Spread on toast", "Season to taste"]
+            },
+            {
+                "Name": "Tomato Basil Pasta",
+                "Calories": 420,
+                "PrepTime": 10,
+                "CookTime": 15,
+                "ProteinContent": 15,
+                "FatContent": 12,
+                "CarbohydrateContent": 68,
+                "FiberContent": 6,
+                "SugarContent": 8,
+                "SaturatedFatContent": 2,
+                "CholesterolContent": 0,
+                "SodiumContent": 320,
+                "RecipeIngredientParts": ["pasta", "tomato", "basil", "garlic", "olive oil", "parmesan"],
+                "RecipeInstructions": ["Cook pasta", "Chop tomatoes", "Sauté garlic", "Combine ingredients", "Garnish with basil"]
             }
         ]
+    
+    def set_request(self, 
+                   nutrition_input: List[float], 
+                   ingredients: List[str], 
+                   params: Dict[str, Any]) -> None:
+        """
+        Set request parameters
         
-        # Filter by ingredients if provided
-        if self.ingredients:
-            normalized_ingredients = self.normalize_ingredients(self.ingredients)
-            filtered_recipes = []
-            for recipe in fallback_recipes:
-                recipe_ingredients = [ing.lower() for ing in recipe["RecipeIngredientParts"]]
-                # Check if any selected ingredient is in recipe
-                if any(ing in recipe_ingredients for ing in normalized_ingredients):
-                    filtered_recipes.append(recipe)
+        Args:
+            nutrition_input: Nutrition values
+            ingredients: List of ingredients
+            params: Algorithm parameters
+        """
+        self.nutrition_input = nutrition_input
+        self.ingredients = ingredients
+        self.params = {**self.DEFAULT_PARAMS, **params}
+        
+    def validate_nutrition_input(self) -> bool:
+        """
+        Validate nutrition input format
+        
+        Returns:
+            bool: True if valid, False otherwise
+        """
+        if not self.nutrition_input:
+            logger.warning("Nutrition input is empty")
+            return False
             
-            if filtered_recipes:
-                return filtered_recipes[:self.params["n_neighbors"]]
+        if len(self.nutrition_input) != len(self.NUTRITION_CATEGORIES):
+            logger.warning(f"Expected {len(self.NUTRITION_CATEGORIES)} nutrition values, "
+                        f"got {len(self.nutrition_input)}. Using default values if needed.")
+            # Pad or truncate to correct length
+            if len(self.nutrition_input) < len(self.NUTRITION_CATEGORIES):
+                self.nutrition_input = self.nutrition_input + [0] * (len(self.NUTRITION_CATEGORIES) - len(self.nutrition_input))
+            else:
+                self.nutrition_input = self.nutrition_input[:len(self.NUTRITION_CATEGORIES)]
+            
+        # Check for negative values (some might be acceptable, but warn)
+        negatives = [val for val in self.nutrition_input if val < 0]
+        if negatives:
+            logger.warning(f"Found {len(negatives)} negative nutrition values. Setting to 0.")
+            self.nutrition_input = [max(0, val) for val in self.nutrition_input]
+            
+        return True
+    
+    def normalize_ingredients(self, ingredients: List[str]) -> List[str]:
+        """
+        Normalize ingredient names (lowercase, strip whitespace)
         
-        return fallback_recipes[:self.params["n_neighbors"]]
+        Args:
+            ingredients: List of ingredient names
+            
+        Returns:
+            List[str]: Normalized ingredient names
+        """
+        normalized = []
+        for ingredient in ingredients:
+            if ingredient and str(ingredient).strip():  # Skip empty strings
+                normalized.append(str(ingredient).strip().lower())
+        return list(set(normalized))  # Remove duplicates
+    
+    def get_ingredient_suggestions(self, category: Optional[str] = None) -> List[str]:
+        """
+        Get ingredient suggestions by category or all
+        
+        Args:
+            category: Optional category name
+            
+        Returns:
+            List[str]: List of ingredient suggestions
+        """
+        if category and category in self.INGREDIENT_CATEGORIES:
+            return self.INGREDIENT_CATEGORIES[category]
+        elif category:
+            logger.warning(f"Category '{category}' not found")
+            return []
+        else:
+            # Return all ingredients flattened
+            all_ingredients = []
+            for cat_ingredients in self.INGREDIENT_CATEGORIES.values():
+                all_ingredients.extend(cat_ingredients)
+            return all_ingredients
+    
+    def get_categorized_ingredients(self) -> Dict[str, List[str]]:
+        """
+        Get ingredients organized by category
+        
+        Returns:
+            Dict[str, List[str]]: Categorized ingredients
+        """
+        return self.INGREDIENT_CATEGORIES.copy()
+    
+    def _generate_standalone_recommendations(self) -> List[Dict[str, Any]]:
+        """
+        Generate recommendations using standalone logic (no API)
+        
+        Returns:
+            List[Dict[str, Any]]: Recipe recommendations
+        """
+        n_neighbors = self.params.get("n_neighbors", 5)
+        
+        # Filter recipes based on ingredients
+        normalized_ingredients = self.normalize_ingredients(self.ingredients)
+        
+        if normalized_ingredients:
+            # Score recipes based on ingredient matches
+            scored_recipes = []
+            for recipe in self.recipe_database:
+                recipe_ingredients = [ing.lower() for ing in recipe["RecipeIngredientParts"]]
+                
+                # Calculate match score
+                matches = sum(1 for ing in normalized_ingredients if any(ing in recipe_ing for recipe_ing in recipe_ingredients))
+                score = matches / len(normalized_ingredients) if normalized_ingredients else 0
+                
+                # Add nutrition similarity score (simplified)
+                if self.nutrition_input:
+                    cal_diff = abs(recipe.get("Calories", 0) - self.nutrition_input[0]) / max(self.nutrition_input[0], 1)
+                    nutrition_score = 1 / (1 + cal_diff)
+                    score = (score + nutrition_score) / 2
+                
+                scored_recipes.append((score, recipe))
+            
+            # Sort by score and take top N
+            scored_recipes.sort(key=lambda x: x[0], reverse=True)
+            recommendations = [recipe for _, recipe in scored_recipes[:n_neighbors]]
+            
+            # Add similarity scores
+            for i, recipe in enumerate(recommendations):
+                recipe["similarity_score"] = round(0.8 - (i * 0.1), 2)  # Decreasing similarity
+        
+        else:
+            # No ingredients specified, return random selection
+            recommendations = random.sample(self.recipe_database, min(n_neighbors, len(self.recipe_database)))
+            for i, recipe in enumerate(recommendations):
+                recipe["similarity_score"] = round(random.uniform(0.6, 0.9), 2)
+        
+        return recommendations
+    
+    def generate(self) -> Dict[str, Any]:
+        """
+        Generate recipe recommendations with automatic fallback
+        
+        Returns:
+            Dict[str, Any]: Recipe recommendations response
+        """
+        # Validate input
+        if not self.validate_nutrition_input():
+            # Use default nutrition values if invalid
+            if not self.nutrition_input:
+                self.nutrition_input = [500] * len(self.NUTRITION_CATEGORIES)
+        
+        # Normalize ingredients
+        normalized_ingredients = self.normalize_ingredients(self.ingredients)
+        
+        # Prepare request data
+        request_data = RecipeRequest(
+            nutrition_input=self.nutrition_input,
+            ingredients=normalized_ingredients,
+            params=self.params
+        )
+        
+        self.last_request_time = time.time()
+        
+        # Try API if available
+        if self.api_available:
+            try:
+                logger.info("Attempting API request...")
+                response = self.api.predict(request_data)
+                self.last_response = response
+                self.api_available = True  # API worked, keep it enabled
+                
+                return {
+                    "success": True,
+                    "output": response.get("output", []),
+                    "metadata": {
+                        "source": "api",
+                        "api_available": True,
+                        "ingredients_used": normalized_ingredients,
+                        "nutrition_input": self.nutrition_input
+                    }
+                }
+                
+            except ConnectionError as e:
+                logger.warning(f"API request failed: {e}")
+                self.api_available = False  # Disable API for next time
+                # Fall through to standalone mode
+        
+        # Use standalone mode (fallback)
+        logger.info("Using standalone recommendation mode")
+        recommendations = self._generate_standalone_recommendations()
+        
+        return {
+            "success": True,
+            "output": recommendations,
+            "metadata": {
+                "source": "standalone",
+                "api_available": self.api_available,
+                "ingredients_used": normalized_ingredients,
+                "nutrition_input": self.nutrition_input,
+                "message": "Generated using built-in recipe database"
+            }
+        }
     
     def get_response_stats(self) -> Dict[str, Any]:
         """
@@ -451,27 +609,11 @@ class Generator:
         Returns:
             Dict[str, Any]: Response statistics
         """
-        if not self.last_response:
-            return {"status": "no_response", "message": "No response generated yet"}
-        
         stats = {
-            "status_code": self.last_response.status_code,
-            "response_time": self.last_request_time,
-            "url": self.last_response.url,
-            "headers": dict(self.last_response.headers),
+            "api_available": self.api_available,
+            "last_request_time": self.last_request_time,
+            "mode": "api" if self.api_available else "standalone"
         }
-        
-        if self.last_response.status_code == 200:
-            try:
-                data = self.last_response.json()
-                stats.update({
-                    "recipe_count": len(data.get("output", [])),
-                    "has_output": "output" in data,
-                    "has_errors": "errors" in data,
-                    "has_warnings": "warnings" in data,
-                })
-            except:
-                stats["parse_error"] = "Failed to parse JSON response"
         
         return stats
     
@@ -483,85 +625,49 @@ class Generator:
         """
         results = {
             "api_url": self.api.base_url,
-            "health_check": False,
-            "api_stats": {},
+            "api_available": self.api_available,
+            "standalone_mode": not self.api_available,
             "timestamp": time.time(),
+            "recipe_database_size": len(self.recipe_database)
         }
-        
-        try:
-            results["health_check"] = self.api.check_health()
-            results["api_stats"] = self.api.get_stats()
-            results["status"] = "connected" if results["health_check"] else "unhealthy"
-        except Exception as e:
-            results["status"] = "error"
-            results["error"] = str(e)
         
         return results
 
 
 # ================= TEST & EXAMPLE USAGE =================
 if __name__ == "__main__":
-    # Example 1: Basic usage
+    # Test the generator
     print("=" * 50)
-    print("Example 1: Basic Recipe Generation")
+    print("Testing Recipe Generator")
     print("=" * 50)
     
+    # Create generator instance
     generator = Generator(
         nutrition_input=[500, 25, 8, 100, 400, 100, 12, 15, 30],
         ingredients=["chicken", "rice", "broccoli"],
         params={"n_neighbors": 3}
     )
     
-    # Test connection first
+    # Test connection
     connection_test = generator.test_connection()
     print("Connection Test:", json.dumps(connection_test, indent=2))
     
-    if connection_test.get("health_check"):
-        try:
-            response = generator.generate()
-            print(f"\nStatus Code: {response.status_code}")
-            if response.status_code == 200:
-                recipes = response.json().get("output", [])
-                print(f"Found {len(recipes)} recipes:")
-                for i, recipe in enumerate(recipes, 1):
-                    print(f"  {i}. {recipe.get('Name', 'Unknown')} - {recipe.get('Calories', 0)} cal")
-        except Exception as e:
-            print(f"Error: {e}")
-            print("Using fallback recipes:")
-            fallback = generator.generate_with_fallback()
-            for i, recipe in enumerate(fallback, 1):
-                print(f"  {i}. {recipe.get('Name', 'Unknown')} - {recipe.get('Calories', 0)} cal")
-    else:
-        print("API server not available, showing fallback:")
-        fallback = generator.generate_with_fallback()
-        for i, recipe in enumerate(fallback, 1):
-            print(f"  {i}. {recipe.get('Name', 'Unknown')} - {recipe.get('Calories', 0)} cal")
-    
-    # Example 2: Get ingredient suggestions
-    print("\n" + "=" * 50)
-    print("Example 2: Ingredient Suggestions")
-    print("=" * 50)
-    
-    print("Vegetable suggestions:", generator.get_ingredient_suggestions("Vegetables")[:5])
-    print("Protein suggestions:", generator.get_ingredient_suggestions("Proteins")[:5])
-    
-    # Example 3: Response statistics
-    print("\n" + "=" * 50)
-    print("Example 3: Response Statistics")
-    print("=" * 50)
-    
-    stats = generator.get_response_stats()
-    print("Response Stats:", json.dumps(stats, indent=2))
-    
-    # Example 4: Categorized ingredients
-    print("\n" + "=" * 50)
-    print("Example 4: Ingredient Categories")
-    print("=" * 50)
-    
-    categories = generator.get_categorized_ingredients()
-    for category, items in categories.items():
-        print(f"{category}: {len(items)} items")
-    
-    print("\n" + "=" * 50)
-    print("Generator initialized successfully!")
-    print("=" * 50)
+    # Generate recommendations
+    print("\nGenerating recommendations...")
+    try:
+        result = generator.generate()
+        
+        if result["success"]:
+            print(f"\nSuccess! Generated {len(result['output'])} recipes")
+            print(f"Source: {result['metadata']['source']}")
+            
+            for i, recipe in enumerate(result["output"], 1):
+                print(f"\n{i}. {recipe.get('Name', 'Unknown')}")
+                print(f"   Calories: {recipe.get('Calories', 0)}")
+                print(f"   Protein: {recipe.get('ProteinContent', 0)}g")
+                print(f"   Ingredients: {', '.join(recipe.get('RecipeIngredientParts', [])[:3])}...")
+        else:
+            print("Failed to generate recommendations")
+            
+    except Exception as e:
+        print(f"Error during generation: {e}")
