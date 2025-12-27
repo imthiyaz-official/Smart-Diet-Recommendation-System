@@ -1,0 +1,7 @@
+streamlit
+requests
+pandas
+numpy
+streamlit-echarts
+beautifulsoup4
+lxml
